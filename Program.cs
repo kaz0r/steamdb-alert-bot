@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Generic;
 using System.IO;
+using System.Linq;
 using System.Threading;
 using SteamKit2;
 
@@ -13,6 +14,7 @@ class Program
 
     static bool isRunning;
     static string user, pass;
+    static uint lastChangeNumber = 0;
 
     static void Main(string[] args)
     {
@@ -62,6 +64,7 @@ class Program
         manager.Subscribe<SteamUser.LoggedOnCallback>(OnLoggedOn);
         manager.Subscribe<SteamUser.LoggedOffCallback>(OnLoggedOff);
         manager.Subscribe<SteamApps.PICSProductInfoCallback>(OnProductInfo);
+        manager.Subscribe<SteamApps.PICSChangesCallback>(OnPICSChanges);
 
         isRunning = true;
 
@@ -113,8 +116,9 @@ class Program
 
         Console.WriteLine("Successfully logged on!");
 
-        // Now request product info for Dota 2
-        steamApps.PICSGetProductInfo(new SteamApps.PICSRequest(570), null);
+        // Start monitoring changes
+        Console.WriteLine("Starting change monitoring...");
+        MonitorChanges();
     }
 
     static void OnLoggedOff(SteamUser.LoggedOffCallback callback)
@@ -126,11 +130,10 @@ class Program
     {
         foreach (var app in callback.Apps.Values)
         {
-            Console.WriteLine("Got product info for app {0}: {1}", app.ID, app.KeyValues["common"]["name"].Value);
+            var appName = app.KeyValues["common"]["name"].Value;
+            Console.WriteLine("📦 App updated: {0} - {1}", app.ID, appName);
 
             var depots = app.KeyValues["depots"];
-            Console.WriteLine("Found {0} depot entries", depots.Children.Count);
-
             int contentDepots = 0;
 
             // Look for content depots
@@ -145,14 +148,43 @@ class Program
                         var manifestId = publicManifest["gid"].AsUnsignedLong();
                         var size = publicManifest["size"].AsUnsignedLong();
 
-                        Console.WriteLine("Depot {0}: Manifest {1}, Size: {2} bytes", depotId, manifestId, size);
+                        Console.WriteLine("  Depot {0}: Manifest {1}, Size: {2:N0} bytes", depotId, manifestId, size);
                         contentDepots++;
                     }
                 }
             }
+
+            Console.WriteLine("  Total depots: {0}", contentDepots);
+        }
+    }
+
+    static void MonitorChanges()
+    {
+        // Get recent changes
+        steamApps.PICSGetChangesSince(lastChangeNumber, true, false);
+    }
+
+    static void OnPICSChanges(SteamApps.PICSChangesCallback callback)
+    {
+        Console.WriteLine("Got PICS changes! Current change number: {0}", callback.CurrentChangeNumber);
+
+        if (callback.AppChanges.Count > 0)
+        {
+            Console.WriteLine("App changes detected: {0}", callback.AppChanges.Count);
+
+            foreach (var appChange in callback.AppChanges.Take(10)) // Show first 10
+            {
+                Console.WriteLine("App {0} changed", appChange.Key);
+
+                // Get product info for changed app
+                steamApps.PICSGetProductInfo(new SteamApps.PICSRequest(appChange.Key), null);
+            }
         }
 
-        Console.WriteLine("\nExiting...");
-        steamUser.LogOff();
+        // Update our change number
+        lastChangeNumber = callback.CurrentChangeNumber;
+
+        // Schedule next check in 30 seconds
+        var timer = new Timer(_ => MonitorChanges(), null, TimeSpan.FromSeconds(30), TimeSpan.FromMilliseconds(-1));
     }
 }
