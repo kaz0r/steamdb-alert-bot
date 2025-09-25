@@ -19,6 +19,7 @@ class Program
     static string user = string.Empty, pass = string.Empty;
     static uint lastChangeNumber = 0;
     static Dictionary<string, HashSet<string>> previousManifests = new Dictionary<string, HashSet<string>>();
+    static readonly object manifestCacheLock = new object();
     static readonly string manifestCacheFile = "manifest_cache.json";
     static readonly JsonSerializerOptions jsonOptions = new JsonSerializerOptions { WriteIndented = true };
 
@@ -163,13 +164,77 @@ class Program
                         // Scan for suspicious files (only scan first depot to avoid spam)
                         if (contentDepots == 1 && manifestId > 0)
                         {
-                            // Get depot decryption key first
+                            // Try to get depot decryption key, but continue monitoring even if it fails
                             _ = Task.Run(async () =>
                             {
                                 try
                                 {
-                                    Console.WriteLine("  🔑 Requesting depot key for depot {0}...", depotId);
-                                    var depotKeyResult = await steamApps.GetDepotDecryptionKey(depotId, app.ID);
+                                    Console.WriteLine("  🔑 Requesting app license and depot key for app {0}, depot {1}...", app.ID, depotId);
+
+                                    // Try to request a free license for public apps
+                                    try
+                                    {
+                                        Console.WriteLine("  📄 Attempting to acquire free license for app {0}...", app.ID);
+                                        using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(30));
+                                        var licenseJob = steamApps.RequestFreeLicense(app.ID);
+                                        var licenseTask = Task.Run(async () => await licenseJob, cts.Token);
+                                        var licenseResult = await licenseTask;
+
+                                        if (licenseResult.Result == EResult.OK)
+                                        {
+                                            Console.WriteLine("  ✅ Acquired free license for app {0}", app.ID);
+                                        }
+                                        else if (licenseResult.Result == EResult.AlreadyOwned)
+                                        {
+                                            Console.WriteLine("  ✅ App {0} already owned", app.ID);
+                                        }
+                                        else
+                                        {
+                                            Console.WriteLine("  ℹ️ Could not acquire free license for app {0}: {1}", app.ID, licenseResult.Result);
+                                        }
+                                    }
+                                    catch (OperationCanceledException)
+                                    {
+                                        Console.WriteLine("  ⏰ License request timed out for app {0}", app.ID);
+                                    }
+                                    catch (Exception licenseEx)
+                                    {
+                                        Console.WriteLine("  ⚠️ License acquisition failed: {0}", licenseEx.Message);
+                                    }
+
+                                    // Get access token for the app
+                                    var accessTokenJob = steamApps.PICSGetAccessTokens([app.ID], []);
+                                    var accessTokenResult = await accessTokenJob;
+
+                                    ulong accessToken = 0;
+
+                                    if (accessTokenResult.AppTokens != null && accessTokenResult.AppTokens.TryGetValue(app.ID, out accessToken))
+                                    {
+                                        if (accessToken > 0)
+                                        {
+                                            Console.WriteLine("  ✅ Got access token for app {0}: {1}", app.ID, accessToken);
+                                        }
+                                        else
+                                        {
+                                            Console.WriteLine("  ℹ️ App {0} is public (no access token needed)", app.ID);
+                                        }
+                                    }
+                                    else if (accessTokenResult.AppTokensDenied != null && accessTokenResult.AppTokensDenied.Contains(app.ID))
+                                    {
+                                        Console.WriteLine("  ❌ Access token denied for app {0} - using fallback monitoring", app.ID);
+                                        await MonitorDepotWithoutKey(app.ID, appName, depotId, manifestId, size);
+                                        return;
+                                    }
+                                    else
+                                    {
+                                        Console.WriteLine("  ⚠️ Failed to get access token - trying depot key anyway");
+                                    }
+
+                                    // Now request depot key with timeout
+                                    using var keyRequestCts = new CancellationTokenSource(TimeSpan.FromSeconds(30));
+                                    var depotKeyJob = steamApps.GetDepotDecryptionKey(depotId, app.ID);
+                                    var depotKeyTask = Task.Run(async () => await depotKeyJob, keyRequestCts.Token);
+                                    var depotKeyResult = await depotKeyTask;
 
                                     if (depotKeyResult.Result == EResult.OK)
                                     {
@@ -178,12 +243,25 @@ class Program
                                     }
                                     else
                                     {
-                                        Console.WriteLine("  ❌ Failed to get depot key: {0}", depotKeyResult.Result);
+                                        Console.WriteLine("  ❌ Failed to get depot key: {0} - using fallback monitoring", depotKeyResult.Result);
+                                        // Fallback: Track depot changes and analyze available metadata
+                                        await MonitorDepotWithoutKey(app.ID, appName, depotId, manifestId, size);
                                     }
+                                }
+                                catch (OperationCanceledException)
+                                {
+                                    Console.WriteLine("  ⏰ Depot key request timed out - using fallback monitoring");
+                                    await MonitorDepotWithoutKey(app.ID, appName, depotId, manifestId, size);
                                 }
                                 catch (Exception e)
                                 {
-                                    Console.WriteLine("  ❌ Error getting depot key: {0}", e.Message);
+                                    Console.WriteLine("  ❌ Error getting depot key: {0} - using fallback monitoring", e.Message);
+                                    if (e.InnerException != null)
+                                    {
+                                        Console.WriteLine("  🔍 Inner exception: {0}", e.InnerException.Message);
+                                    }
+                                    // Fallback: Track depot changes and analyze available metadata
+                                    await MonitorDepotWithoutKey(app.ID, appName, depotId, manifestId, size);
                                 }
                             });
                         }
@@ -234,82 +312,213 @@ class Program
             // Create CDN client
             var cdnClient = new Client(steamClient);
 
-            // Use Steam's CDN servers (create server using implicit conversion from DNS endpoint)
-            SteamKit2.CDN.Server server = new System.Net.DnsEndPoint("steamcdn-a.akamaihd.net", 80);
+            // Use a simple CDN server endpoint (implicit conversion from DnsEndPoint to Server)
+            Server server = new System.Net.DnsEndPoint("steamcdn-a.akamaihd.net", 80);
+            Console.WriteLine("  🌐 Using CDN server: steamcdn-a.akamaihd.net:80");
 
-            // Download the actual manifest with depot key
+            // Download the actual manifest with depot key and timeout
             Console.WriteLine("  📥 Downloading manifest {0} for depot {1}...", manifestId, depotId);
-            var manifest = await cdnClient.DownloadManifestAsync(depotId, manifestId, 0, server, depotKey);
 
-            if (manifest?.Files == null)
+            using var downloadCts = new CancellationTokenSource(TimeSpan.FromMinutes(2));
+            var manifest = await cdnClient.DownloadManifestAsync(depotId, manifestId, manifestId, server, depotKey).WaitAsync(downloadCts.Token);
+
+            if (manifest != null)
             {
-                Console.WriteLine("  ❌ Failed to download or parse manifest");
-                return;
-            }
-
-            Console.WriteLine("  📄 Scanning {0} files in manifest...", manifest.Files.Count);
-
-            // Get manifest key for caching
-            var manifestKey = $"{appId}_{depotId}";
-
-            // Get current file list
-            var currentFiles = new HashSet<string>(manifest.Files.Select(f => f.FileName));
-
-            // Get previous file list
-            var previousFiles = previousManifests.TryGetValue(manifestKey, out var prev) ? prev : [];
-
-            // Find new files (files in current but not in previous)
-            var newFiles = currentFiles.Except(previousFiles).ToList();
-
-            Console.WriteLine("  📊 New files: {0}, Total files: {1}", newFiles.Count, currentFiles.Count);
-
-            // Look for suspicious file extensions in new files only (prioritizing .7z, .zip, .bat as requested)
-            var suspiciousExtensions = new[] { ".7z", ".zip", ".bat", ".exe", ".cmd", ".ps1", ".vbs", ".jar" };
-            var suspiciousNewFiles = new List<string>();
-
-            foreach (var fileName in newFiles)
-            {
-                var lowerFileName = fileName.ToLowerInvariant();
-
-                foreach (var ext in suspiciousExtensions)
-                {
-                    if (lowerFileName.EndsWith(ext))
-                    {
-                        suspiciousNewFiles.Add(fileName);
-                        break;
-                    }
-                }
-            }
-
-            if (suspiciousNewFiles.Count > 0)
-            {
-                Console.WriteLine("🚨 ALERT: App {0} ({1}) has {2} NEW suspicious files!", appId, appName, suspiciousNewFiles.Count);
-                Console.WriteLine("  New suspicious files:");
-                foreach (var file in suspiciousNewFiles.Take(10)) // Show first 10
-                {
-                    Console.WriteLine("    {0}", file);
-                }
-                if (suspiciousNewFiles.Count > 10)
-                {
-                    Console.WriteLine("    ... and {0} more new suspicious files", suspiciousNewFiles.Count - 10);
-                }
-            }
-            else if (newFiles.Count > 0)
-            {
-                Console.WriteLine("  ✅ {0} new files found, but none suspicious", newFiles.Count);
+                Console.WriteLine("  ✅ Manifest downloaded successfully, processing...");
+                await ProcessManifest(manifest, appId, appName, depotId);
             }
             else
             {
-                Console.WriteLine("  ℹ️ No new files detected");
+                Console.WriteLine("  ❌ Manifest download returned null");
             }
-
-            // Update cache with current file list
-            previousManifests[manifestKey] = currentFiles;
-            SaveManifestCache();
+        }
+        catch (OperationCanceledException)
+        {
+            Console.WriteLine("  ⏰ Manifest download timed out after 2 minutes");
         }
         catch (Exception e)
         {
             Console.WriteLine("  ❌ Error scanning manifest: {0}", e.Message);
+            if (e.InnerException != null)
+            {
+                Console.WriteLine("  🔍 Inner exception: {0}", e.InnerException.Message);
+            }
+        }
+    }
+
+    static async Task ProcessManifest(DepotManifest manifest, uint appId, string appName, uint depotId)
+    {
+        if (manifest?.Files == null)
+        {
+            Console.WriteLine("  ❌ Failed to download or parse manifest");
+            return;
+        }
+
+        Console.WriteLine("  📄 Scanning {0} files in manifest...", manifest.Files.Count);
+
+        // Get manifest key for caching
+        var manifestKey = $"{appId}_{depotId}";
+
+        // Get current file list
+        var currentFiles = new HashSet<string>(manifest.Files.Select(f => f.FileName));
+
+        // Get previous file list
+        HashSet<string> previousFiles;
+        lock (manifestCacheLock)
+        {
+            previousFiles = previousManifests.TryGetValue(manifestKey, out var prev) ? prev : new HashSet<string>();
+        }
+
+        // Find new files (files in current but not in previous)
+        var newFiles = currentFiles.Except(previousFiles).ToList();
+
+        Console.WriteLine("  📊 New files: {0}, Total files: {1}", newFiles.Count, currentFiles.Count);
+
+        // Look for suspicious file extensions in new files only (prioritizing .7z, .zip, .bat as requested)
+        var suspiciousExtensions = new[] { ".7z", ".zip", ".bat", ".exe", ".cmd", ".ps1", ".vbs", ".jar" };
+        var suspiciousNewFiles = new List<string>();
+
+        foreach (var fileName in newFiles)
+        {
+            var lowerFileName = fileName.ToLowerInvariant();
+
+            foreach (var ext in suspiciousExtensions)
+            {
+                if (lowerFileName.EndsWith(ext))
+                {
+                    suspiciousNewFiles.Add(fileName);
+                    break;
+                }
+            }
+        }
+
+        if (suspiciousNewFiles.Count > 0)
+        {
+            Console.WriteLine("🚨 ALERT: App {0} ({1}) has {2} NEW suspicious files!", appId, appName, suspiciousNewFiles.Count);
+            Console.WriteLine("  New suspicious files:");
+            foreach (var file in suspiciousNewFiles.Take(10)) // Show first 10
+            {
+                Console.WriteLine("    {0}", file);
+            }
+            if (suspiciousNewFiles.Count > 10)
+            {
+                Console.WriteLine("    ... and {0} more new suspicious files", suspiciousNewFiles.Count - 10);
+            }
+        }
+        else if (newFiles.Count > 0)
+        {
+            Console.WriteLine("  ✅ {0} new files found, but none suspicious", newFiles.Count);
+        }
+        else
+        {
+            Console.WriteLine("  ℹ️ No new files detected");
+        }
+
+        // Update cache with current file list
+        lock (manifestCacheLock)
+        {
+            previousManifests[manifestKey] = currentFiles;
+        }
+        SaveManifestCache();
+
+        await Task.CompletedTask; // Satisfy async requirement
+    }
+
+    static async Task MonitorDepotWithoutKey(uint appId, string appName, uint depotId, ulong manifestId, ulong size)
+    {
+        try
+        {
+            Console.WriteLine("  📊 Monitoring depot {0} without key (manifest {1}, size: {2:N0} bytes)", depotId, manifestId, size);
+
+            var manifestKey = $"{appId}_{depotId}";
+
+            // Check if this is a new manifest (different from what we've seen before)
+            var cacheKey = $"{manifestKey}_manifest";
+            ulong previousManifestId;
+            lock (manifestCacheLock)
+            {
+                previousManifestId = previousManifests.TryGetValue(cacheKey, out var prevSet) && prevSet.Count > 0
+                    ? ulong.Parse(prevSet.First()) : 0UL;
+            }
+
+            if (previousManifestId != manifestId)
+            {
+                Console.WriteLine("  🔄 New manifest detected for depot {0}! (was: {1}, now: {2})", depotId, previousManifestId, manifestId);
+
+                // Analyze suspicious patterns without downloading files
+                var suspiciousIndicators = new List<string>();
+
+                // Check for rapid size changes (could indicate file additions)
+                var sizeCacheKey = $"{manifestKey}_size";
+                HashSet<string>? prevSizeSet;
+                lock (manifestCacheLock)
+                {
+                    previousManifests.TryGetValue(sizeCacheKey, out prevSizeSet);
+                }
+
+                if (prevSizeSet != null && prevSizeSet.Count > 0)
+                {
+                    if (ulong.TryParse(prevSizeSet.First(), out var previousSize))
+                    {
+                        var sizeDelta = size - previousSize;
+                        var sizeChangePercent = previousSize > 0 ? (double)sizeDelta / previousSize * 100 : 0;
+
+                        if (sizeDelta > 10_000_000) // 10MB+ increase
+                        {
+                            suspiciousIndicators.Add($"Large size increase: +{sizeDelta:N0} bytes (+{sizeChangePercent:F1}%)");
+                        }
+                        else if (sizeDelta > 0)
+                        {
+                            Console.WriteLine("  📈 Size increased by {0:N0} bytes ({1:F1}%)", sizeDelta, sizeChangePercent);
+                        }
+                    }
+                }
+
+                // Check app name for suspicious keywords
+                var suspiciousNames = new[] { "crack", "keygen", "patch", "trainer", "cheat", "hack" };
+                foreach (var keyword in suspiciousNames)
+                {
+                    if (appName.ToLowerInvariant().Contains(keyword))
+                    {
+                        suspiciousIndicators.Add($"Suspicious app name contains: '{keyword}'");
+                        break;
+                    }
+                }
+
+                // Generate alert for suspicious patterns
+                if (suspiciousIndicators.Count > 0)
+                {
+                    Console.WriteLine("🚨 ALERT: App {0} ({1}) shows suspicious patterns!", appId, appName);
+                    Console.WriteLine("  Depot {0} updated with potential indicators:", depotId);
+                    foreach (var indicator in suspiciousIndicators)
+                    {
+                        Console.WriteLine("    • {0}", indicator);
+                    }
+                    Console.WriteLine("  ⚠️ Manual investigation recommended - cannot scan files without depot key");
+                }
+                else
+                {
+                    Console.WriteLine("  ✅ Depot updated but no suspicious patterns detected");
+                }
+
+                // Update cache with new manifest ID and size
+                lock (manifestCacheLock)
+                {
+                    previousManifests[cacheKey] = [manifestId.ToString()];
+                    previousManifests[sizeCacheKey] = [size.ToString()];
+                }
+                SaveManifestCache();
+            }
+            else
+            {
+                Console.WriteLine("  ℹ️ Same manifest as before, no changes detected");
+            }
+
+            await Task.Delay(100); // Small delay to avoid overwhelming the console
+        }
+        catch (Exception e)
+        {
+            Console.WriteLine("  ❌ Error in fallback monitoring: {0}", e.Message);
         }
     }
 
@@ -338,10 +547,14 @@ class Program
     {
         try
         {
-            var data = previousManifests.ToDictionary(
-                kvp => kvp.Key,
-                kvp => kvp.Value.ToList()
-            );
+            Dictionary<string, List<string>> data;
+            lock (manifestCacheLock)
+            {
+                data = previousManifests.ToDictionary(
+                    kvp => kvp.Key,
+                    kvp => kvp.Value.ToList()
+                );
+            }
             var json = JsonSerializer.Serialize(data, jsonOptions);
             File.WriteAllText(manifestCacheFile, json);
         }
